@@ -63,7 +63,6 @@ from tmrl.training_offline import TrainingOffline
 import numpy as np
 import os
 
-
 # Now, let us look into the content of config.json:
 
 # =====================================================================
@@ -156,7 +155,6 @@ dataset_path = cfg.DATASET_PATH
 # (Note: if your script defines the name "obs_preprocessor", we will use your preprocessor instead of the default)
 obs_preprocessor = cfg_obj.OBS_PREPROCESSOR
 
-
 # =====================================================================
 # COMPETITION FIXED PARAMETERS
 # =====================================================================
@@ -167,7 +165,6 @@ env_cls = cfg_obj.ENV_CLS
 
 # Device used for inference on workers (change if you like but keep in mind that the competition evaluation is on CPU)
 device_worker = 'cpu'
-
 
 # =====================================================================
 # ENVIRONMENT PARAMETERS
@@ -196,7 +193,6 @@ imgs_buf_len = cfg.IMG_HIST_LEN
 # (Note: The tutorial will stop working if you change this)
 act_buf_len = cfg.ACT_BUF_LEN
 
-
 # =====================================================================
 # MEMORY CLASS
 # =====================================================================
@@ -214,7 +210,6 @@ memory_cls = partial(memory_base_cls,
                      act_buf_len=act_buf_len,
                      crc_debug=False)
 
-
 # =====================================================================
 # CUSTOM MODEL
 # =====================================================================
@@ -231,7 +226,6 @@ memory_cls = partial(memory_base_cls,
 # that we simply copy/paste and adapt in this tutorial.
 LOG_STD_MAX = 2
 LOG_STD_MIN = -20
-
 
 # Let us import the ActorModule that we are supposed to implement.
 # We will use PyTorch in this tutorial.
@@ -285,8 +279,10 @@ def num_flat_features(x):
 
 # The next utility computes the dimensionality of the output in a 2D CNN layer:
 def conv2d_out_dims(conv_layer, h_in, w_in):
-    h_out = floor((h_in + 2 * conv_layer.padding[0] - conv_layer.dilation[0] * (conv_layer.kernel_size[0] - 1) - 1) / conv_layer.stride[0] + 1)
-    w_out = floor((w_in + 2 * conv_layer.padding[1] - conv_layer.dilation[1] * (conv_layer.kernel_size[1] - 1) - 1) / conv_layer.stride[1] + 1)
+    h_out = floor((h_in + 2 * conv_layer.padding[0] - conv_layer.dilation[0] * (conv_layer.kernel_size[0] - 1) - 1) /
+                  conv_layer.stride[0] + 1)
+    w_out = floor((w_in + 2 * conv_layer.padding[1] - conv_layer.dilation[1] * (conv_layer.kernel_size[1] - 1) - 1) /
+                  conv_layer.stride[1] + 1)
     return h_out, w_out
 
 
@@ -400,6 +396,7 @@ class TorchJSONEncoder(json.JSONEncoder):
     """
     Custom JSON encoder for torch tensors, used in the custom save() method of our ActorModule.
     """
+
     def default(self, obj):
         if isinstance(obj, torch.Tensor):
             return obj.cpu().detach().numpy().tolist()
@@ -410,6 +407,7 @@ class TorchJSONDecoder(json.JSONDecoder):
     """
     Custom JSON decoder for torch tensors, used in the custom load() method of our ActorModule.
     """
+
     def __init__(self, *args, **kwargs):
         super().__init__(object_hook=self.object_hook, *args, **kwargs)
 
@@ -429,6 +427,7 @@ class MyActorModule(TorchActorModule):
 
     (Note: TorchActorModule is a subclass of ActorModule and torch.nn.Module)
     """
+
     def __init__(self, observation_space, action_space):
         """
         When implementing __init__, we need to take the observation_space and action_space arguments.
@@ -572,6 +571,7 @@ class VanillaCNNQFunction(nn.Module):
     """
     Critic module for SAC.
     """
+
     def __init__(self, observation_space, action_space):
         super().__init__()
         self.net = VanillaCNN(q_net=True)  # q_net is True for a critic module
@@ -603,6 +603,7 @@ class VanillaCNNActorCritic(nn.Module):
     """
     Actor-critic module for the SAC algorithm.
     """
+
     def __init__(self, observation_space, action_space):
         super().__init__()
 
@@ -743,8 +744,8 @@ class SACTrainingAgent(TrainingAgent):
             backup = r + self.gamma * (1 - d) * (q_pi_targ - self.alpha_t * logp_a2)
 
         # This gives us our critic loss, as the difference between the target and the estimate:
-        loss_q1 = ((q1 - backup)**2).mean()
-        loss_q2 = ((q2 - backup)**2).mean()
+        loss_q1 = ((q1 - backup) ** 2).mean()
+        loss_q2 = ((q2 - backup) ** 2).mean()
         loss_q = loss_q1 + loss_q2
 
         # We can now take an optimization step to train our critics in the opposite direction of this loss' gradient:
@@ -801,7 +802,6 @@ training_agent_cls = partial(SACTrainingAgent,
                              lr_actor=0.000005,
                              lr_critic=0.00003)
 
-
 # =====================================================================
 # TMRL TRAINER
 # =====================================================================
@@ -819,7 +819,6 @@ training_cls = partial(
     max_training_steps_per_env_step=max_training_steps_per_env_step,
     start_training=start_training,
     device=device_trainer)
-
 
 # =====================================================================
 # RUN YOUR TRAINING PIPELINE
@@ -869,6 +868,7 @@ if __name__ == "__main__":
         rw.run()
     elif args.server:
         import time
+
         serv = Server(port=server_port,
                       password=password,
                       security=security)
