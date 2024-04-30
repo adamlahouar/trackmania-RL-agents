@@ -183,13 +183,23 @@ class PPOActorModule(TorchActorModule):
 class PPOCriticModule(nn.Module):
     def __init__(self, observation_space, action_space):
         super().__init__()
-        self.network = nn.Sequential(nn.Linear(256, 256), nn.ReLU(),
+        self.network = nn.Sequential(nn.Linear(86, 256), nn.ReLU(),
                                      nn.Linear(256, 256), nn.ReLU(),
-                                     nn.Linear(256, 1), nn.ReLU())
+                                     nn.Linear(256, 1))
 
-    def forward(self, observation, action):
+    def _process_observation(self, observation: tuple[Tensor]) -> Tensor:
+        processed_observations = []
+
+        for tensor in observation:
+            tensor = tensor.flatten(start_dim=1)
+            processed_observations.append(tensor)
+
+        return torch.cat(processed_observations, -1)
+
+    def forward(self, observation: tuple[Tensor], action):
         x = (*observation, action)
-        q = self.network(x)
+        processed_observation = self._process_observation(x)
+        q = self.network(processed_observation)
         return torch.squeeze(q, -1)
 
 
@@ -216,7 +226,6 @@ class PPOTrainingAgent(TrainingAgent):
                  alpha=0.2,
                  lr_actor=1e-3,
                  lr_critic=1e-3):
-        print('training agent init')
         super().__init__(observation_space=observation_space,
                          action_space=action_space,
                          device=device)
