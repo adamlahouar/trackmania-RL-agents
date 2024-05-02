@@ -183,7 +183,7 @@ class PPOActorModule(TorchActorModule):
 class PPOCriticModule(nn.Module):
     def __init__(self, observation_space, action_space):
         super().__init__()
-        self.network = nn.Sequential(nn.Linear(86, 256), nn.ReLU(),
+        self.network = nn.Sequential(nn.Linear(83, 256), nn.ReLU(),
                                      nn.Linear(256, 256), nn.ReLU(),
                                      nn.Linear(256, 1))
 
@@ -196,9 +196,8 @@ class PPOCriticModule(nn.Module):
 
         return torch.cat(processed_observations, -1)
 
-    def forward(self, observation: tuple[Tensor], action):
-        x = (*observation, action)
-        processed_observation = self._process_observation(x)
+    def forward(self, observation: tuple[Tensor]):
+        processed_observation = self._process_observation(observation)
         q = self.network(processed_observation)
         return torch.squeeze(q, -1)
 
@@ -208,9 +207,10 @@ class VanillaCNNPPO(nn.Module):
         super().__init__()
 
         self.actor = PPOActorModule(observation_space, action_space)
-
         self.q1 = PPOCriticModule(observation_space, action_space)
-        self.q2 = PPOCriticModule(observation_space, action_space)
+
+        # TODO: remove q2?
+        # self.q2 = PPOCriticModule(observation_space, action_space)
 
 
 class PPOTrainingAgent(TrainingAgent):
@@ -238,75 +238,109 @@ class PPOTrainingAgent(TrainingAgent):
         self.alpha = alpha
         self.lr_actor = lr_actor
         self.lr_critic = lr_critic
-        self.q_params = itertools.chain(self.model.q1.parameters(), self.model.q2.parameters())
+        # self.q_params = itertools.chain(self.model.q1.parameters(), self.model.q2.parameters())
+
         self.pi_optimizer = Adam(self.model.actor.parameters(), lr=self.lr_actor)
-        self.q_optimizer = Adam(self.q_params, lr=self.lr_critic)
+        self.q_optimizer = Adam(self.model.q1.parameters(), lr=self.lr_critic)
         self.alpha_t = torch.tensor(float(self.alpha)).to(self.device)
+
+        # TODO: put these in the config
+        self.lambda_ = 0.95
+        self.clip_ratio = 0.2
 
     def get_actor(self):
         return self.model_nograd.actor
 
-    def _compute_loss_q(self, batch):
-        initial_observations, actions, rewards, final_observations, terminates, _ = batch
+    def _compute_advantages_and_returns(self, rewards, values, terminates):
 
-        q1 = self.model.q1(initial_observations, actions)
-        q2 = self.model.q2(initial_observations, actions)
+        trajectory_length = rewards.size(0)
 
+        deltas = torch.zeros_like(rewards)
+        returns = torch.zeros_like(rewards)
+        advantages = torch.zeros_like(rewards)
+
+        previous_return = 0
+        previous_value = 0
+        previous_advantage = 0
+
+        for t in reversed(range(trajectory_length)):
+            if t == trajectory_length - 1:
+                next_non_terminal = 1.0 - terminates[-1]
+                next_value = values[-1]
+            else:
+                next_non_terminal = 1.0 - terminates[t]
+                next_value = values[t + 1]
+
+            deltas[t] = rewards[t] + self.gamma * next_non_terminal * next_value - values[t]
+            returns[t] = deltas[t] + self.gamma * self.lambda_ * next_non_terminal * previous_return
+            advantages[t] = deltas[t] + self.gamma * self.lambda_ * next_non_terminal * previous_advantage
+
+            previous_return = returns[t]
+            previous_advantage = advantages[t]
+
+        return advantages, returns
+
+    def _compute_loss_pi(self, observations, actions, advantages, logp_old):
+
+        pi, logp = self.model.actor(observations, test=False, compute_logprob=True)
+
+        ratio = torch.exp(logp - logp_old)
+
+        clipped_advantages = torch.clamp(ratio, 1 - self.clip_ratio, 1 + self.clip_ratio) * advantages
+        loss_pi = -torch.min(ratio * advantages, clipped_advantages).mean()
+
+        # kl = (logp_old - logp).mean().item()
+        # ent = pi.entropy().mean().item()
+
+        # clipped = ratio.gt(1 + self.clip_ratio) | ratio.lt(1 - self.clip_ratio)
+        # clipfrac = torch.as_tensor(clipped, dtype=torch.float).mean().item()
+
+        # pi_info = {'kl': kl, 'ent': ent, 'cf': clipfrac}
+
+        return loss_pi  # , pi_info
+
+    def _update_target_model(self):
         with torch.no_grad():
-            target_actions, target_logp = self.model.actor(final_observations)
-
-            q1_pi_target = self.model_target.q1(final_observations, target_actions)
-            q2_pi_target = self.model_target.q2(final_observations, target_actions)
-
-            q_pi_target = torch.min(q1_pi_target, q2_pi_target)
-            backup = rewards + self.gamma * (1 - terminates) * (q_pi_target - self.alpha_t * target_logp)
-
-        q1_loss = ((q1 - backup) ** 2).mean()
-        q2_loss = ((q2 - backup) ** 2).mean()
-        q_loss = q1_loss + q2_loss
-
-        return q_loss
-
-    def _compute_loss_pi(self, observations):
-
-        pi, logp_pi = self.model.actor(observation=observations, test=False, compute_logprob=True)
-
-        q1_pi = self.model.q1(observation=observations, action=pi)
-        q2_pi = self.model.q2(observation=observations, action=pi)
-        q_pi = torch.min(q1_pi, q2_pi)
-
-        loss_pi = (self.alpha_t * logp_pi - q_pi).mean()
-
-        return loss_pi
+            for param, target_param in zip(self.model.parameters(), self.model_target.parameters()):
+                target_param.data.mul_(self.polyak)
+                target_param.data.add_((1 - self.polyak) * param.data)
 
     def train(self, batch):
+
+        # Decompose batch into relevant components
         initial_observations, actions, rewards, final_observations, terminates, _ = batch
 
-        self.q_optimizer.zero_grad()
+        # Get value estimates from critic
+        values = self.model.q1(initial_observations)
 
-        loss_q = self._compute_loss_q(batch)
-        loss_q.backward()
-        self.q_optimizer.step()
+        # Calculate advantages and returns
+        advantages, returns = self._compute_advantages_and_returns(rewards, values, terminates)
 
-        for p in self.q_params:
-            p.requires_grad = False
+        # Get old log probabilities from actor
+        _, logp_old = self.model.actor(initial_observations, test=False, compute_logprob=True)
 
+        # Compute actor and critic losses
+        loss_actor = self._compute_loss_pi(initial_observations, actions, advantages, logp_old)
+        loss_critic = ((values - returns) ** 2).mean()
+
+        # TODO: figure out why this crashes
+
+        # Take optimization step for actor
         self.pi_optimizer.zero_grad()
-        loss_pi = self._compute_loss_pi(initial_observations)
-        loss_pi.backward()
+        loss_actor.backward()
         self.pi_optimizer.step()
 
-        for p in self.q_params:
-            p.requires_grad = True
+        # Take optimization step for critic
+        self.q_optimizer.zero_grad()
+        loss_critic.backward()
+        self.q_optimizer.step()
 
-        with torch.no_grad():
-            for p, p_targ in zip(self.model.parameters(), self.model_target.parameters()):
-                p_targ.data.mul_(self.polyak)
-                p_targ.data.add_((1 - self.polyak) * p.data)
+        # Update target networks
+        self._update_target_model()
 
         ret_dict = dict(
-            loss_actor=loss_pi.detach().item(),
-            loss_critic=loss_q.detach().item()
+            loss_actor=loss_actor.detach().item(),
+            loss_critic=loss_critic.detach().item()
         )
 
         return ret_dict
