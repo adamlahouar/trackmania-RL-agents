@@ -1,31 +1,28 @@
 # TMRL imports
+import json
+# Other imports
+import os
+import random
+from argparse import ArgumentParser
+from copy import deepcopy
+
+import numpy as np
 import tmrl.config.config_constants as cfg
 import tmrl.config.config_objects as cfg_obj
-from tmrl.util import partial, prod, cached_property
-from tmrl.actor import TorchActorModule
-from tmrl.networking import Trainer, RolloutWorker, Server
-from tmrl.training_offline import TrainingOffline
-from tmrl.training import TrainingAgent
-from tmrl.custom.utils.nn import copy_shared, no_grad
-
 # Torch imports
 import torch
 import torch.nn as nn
-from torch.nn.utils import clip_grad_norm_
-import torch.nn.functional as F
+from tmrl.actor import TorchActorModule
+from tmrl.custom.custom_memories import MemoryTM, last_true_in_list, replace_hist_before_eoe
+from tmrl.custom.utils.nn import copy_shared, no_grad
+from tmrl.memory import check_samples_crc
+from tmrl.networking import Trainer, RolloutWorker, Server
+from tmrl.training import TrainingAgent
+from tmrl.training_offline import TrainingOffline
+from tmrl.util import partial, prod, cached_property
+from torch import Tensor
 from torch.distributions.normal import Normal
 from torch.optim import Adam
-from torch import Tensor
-
-# Other imports
-import os
-import numpy as np
-from math import floor
-import json
-from copy import deepcopy
-import itertools
-from argparse import ArgumentParser
-import math
 
 
 class ConfigParameters:
@@ -78,11 +75,165 @@ class ConfigParameters:
         self.imgs_buf_len = cfg.IMG_HIST_LEN
         self.act_buf_len = cfg.ACT_BUF_LEN
 
+        # Custom stuff
+        self.LOG_STD_MIN = -20
+        self.LOG_STD_MAX = 2
+        self.lambda_ = 0.97
+        self.clip_ratio = 0.2
+        self.max_grad_norm = 0.5
+        self.training_iterations = 80
+        self.target_kl = 0.01
+
 
 params = ConfigParameters()
 
+
+class PPOCustomMemory(MemoryTM):
+
+    def get_transition(self, item):
+        """
+        CAUTION: item is the first index of the 4 images in the images history of the OLD observation
+        CAUTION: in the buffer, a sample is (act, obs(act)) and NOT (obs, act(obs))
+            i.e. in a sample, the observation is what step returned after being fed act (and preprocessed)
+            therefore, in the RTRL setting, act is appended to obs
+        So we load 5 images from here...
+        Don't forget the info dict for CRC debugging
+        """
+        if self.data[4][item + self.min_samples - 1]:
+            if item == 0:  # if first item of the buffer
+                item += 1
+            elif item == self.__len__() - 1:  # if last item of the buffer
+                item -= 1
+            elif random.random() < 0.5:  # otherwise, sample randomly
+                item += 1
+            else:
+                item -= 1
+
+        idx_last = item + self.min_samples - 1
+        idx_now = item + self.min_samples
+
+        acts = self.load_acts(item)
+        last_act_buf = acts[:-1]
+        new_act_buf = acts[1:]
+
+        imgs = self.load_imgs(item)
+        imgs_last_obs = imgs[:-1]
+        imgs_new_obs = imgs[1:]
+
+        # if a reset transition has influenced the observation, special care must be taken
+        last_eoes = self.data[4][idx_now - self.min_samples:idx_now]  # self.min_samples values
+        last_eoe_idx = last_true_in_list(last_eoes)  # last occurrence of True
+
+        assert last_eoe_idx is None or last_eoes[last_eoe_idx], f"last_eoe_idx:{last_eoe_idx}"
+
+        if last_eoe_idx is not None:
+            replace_hist_before_eoe(hist=new_act_buf, eoe_idx_in_hist=last_eoe_idx - self.start_acts_offset - 1)
+            replace_hist_before_eoe(hist=last_act_buf, eoe_idx_in_hist=last_eoe_idx - self.start_acts_offset)
+            replace_hist_before_eoe(hist=imgs_new_obs, eoe_idx_in_hist=last_eoe_idx - self.start_imgs_offset - 1)
+            replace_hist_before_eoe(hist=imgs_last_obs, eoe_idx_in_hist=last_eoe_idx - self.start_imgs_offset)
+
+        imgs_new_obs = np.ndarray.flatten(imgs_new_obs)
+        imgs_last_obs = np.ndarray.flatten(imgs_last_obs)
+
+        last_obs = (self.data[2][idx_last], imgs_last_obs, *last_act_buf)
+        new_act = self.data[1][idx_now]
+        rew = np.float32(self.data[5][idx_now])
+        new_obs = (self.data[2][idx_now], imgs_new_obs, *new_act_buf)
+        terminated = self.data[7][idx_now]
+        truncated = self.data[8][idx_now]
+        info = self.data[6][idx_now]
+        logprobs = self.data[9][idx_now]
+        rtgs = self.data[10][idx_now]
+
+        return last_obs, new_act, rew, new_obs, terminated, truncated, info, logprobs, rtgs
+
+    def load_imgs(self, item):
+        res = self.data[3][(item + self.start_imgs_offset):(item + self.start_imgs_offset + self.imgs_obs + 1)]
+        return np.stack(res)
+
+    def load_acts(self, item):
+        res = self.data[1][(item + self.start_acts_offset):(item + self.start_acts_offset + self.act_buf_len + 1)]
+        return res
+
+    def append_buffer(self, buffer):
+        """
+        buffer is a list of samples (act, obs, rew, terminated, truncated, info)
+        don't forget to keep the info dictionary in the sample for CRC debugging
+        """
+
+        first_data_idx = self.data[0][-1] + 1 if self.__len__() > 0 else 0
+
+        d0 = [first_data_idx + i for i, _ in enumerate(buffer.memory)]  # indexes
+        d1 = [b[0] for b in buffer.memory]  # actions
+        d2 = [b[1][0] for b in buffer.memory]  # speeds
+        d3 = [b[1][1] for b in buffer.memory]  # lidar
+        d4 = [b[3] or b[4] for b in buffer.memory]  # eoes (terminated or truncated)
+        d5 = [b[2] for b in buffer.memory]  # rewards
+        d6 = [b[5] for b in buffer.memory]  # infos
+        d7 = [b[3] for b in buffer.memory]  # terminated
+        d8 = [b[4] for b in buffer.memory]  # truncated
+        d9 = [b[6] for b in buffer.memory]  # old logprobs
+        d10 = [b[7] for b in buffer.memory]  # rtgs
+
+        if self.__len__() > 0:
+            self.data[0] += d0
+            self.data[1] += d1
+            self.data[2] += d2
+            self.data[3] += d3
+            self.data[4] += d4
+            self.data[5] += d5
+            self.data[6] += d6
+            self.data[7] += d7
+            self.data[8] += d8
+            self.data[9] += d9
+            self.data[10] += d10
+        else:
+            self.data.append(d0)
+            self.data.append(d1)
+            self.data.append(d2)
+            self.data.append(d3)
+            self.data.append(d4)
+            self.data.append(d5)
+            self.data.append(d6)
+            self.data.append(d7)
+            self.data.append(d8)
+            self.data.append(d9)
+            self.data.append(d10)
+
+        to_trim = self.__len__() - self.memory_size
+        if to_trim > 0:
+            self.data[0] = self.data[0][to_trim:]
+            self.data[1] = self.data[1][to_trim:]
+            self.data[2] = self.data[2][to_trim:]
+            self.data[3] = self.data[3][to_trim:]
+            self.data[4] = self.data[4][to_trim:]
+            self.data[5] = self.data[5][to_trim:]
+            self.data[6] = self.data[6][to_trim:]
+            self.data[7] = self.data[7][to_trim:]
+            self.data[8] = self.data[8][to_trim:]
+            self.data[9] = self.data[9][to_trim:]
+            self.data[10] = self.data[10][to_trim:]
+
+        return self
+
+    def __getitem__(self, item):
+        prev_obs, new_act, rew, new_obs, terminated, truncated, info, logprobs, rtgs = self.get_transition(item)
+        if self.crc_debug:
+            po, a, o, r, d, t = info['crc_sample']
+            debug_ts, debug_ts_res = info['crc_sample_ts']
+            check_samples_crc(po, a, o, r, d, t, prev_obs, new_act, new_obs, rew, terminated, truncated, debug_ts,
+                              debug_ts_res)
+        if self.sample_preprocessor is not None:
+            prev_obs, new_act, rew, new_obs, terminated, truncated = self.sample_preprocessor(prev_obs, new_act, rew,
+                                                                                              new_obs, terminated,
+                                                                                              truncated)
+        terminated = np.float32(terminated)  # we don't want bool tensors
+        truncated = np.float32(truncated)  # we don't want bool tensors
+        return prev_obs, new_act, rew, new_obs, terminated, truncated, logprobs, rtgs
+
+
 # Memory class
-memory_cls = partial(params.memory_base_cls,
+memory_cls = partial(PPOCustomMemory,  # params.memory_base_cls
                      memory_size=params.memory_size,
                      batch_size=params.batch_size,
                      sample_preprocessor=params.sample_preprocessor,
@@ -112,105 +263,96 @@ class TorchJSONDecoder(json.JSONDecoder):
         return dct
 
 
+def mlp(sizes, activation, output_activation=nn.Identity):
+    layers = []
+    for j in range(len(sizes) - 1):
+        act = activation if j < len(sizes) - 2 else output_activation
+        layers += [nn.Linear(sizes[j], sizes[j + 1]), act()]
+    return nn.Sequential(*layers)
+
+
 class PPOActorModule(TorchActorModule):
-
-    def __init__(self, observation_space, action_space):
+    def __init__(self, observation_space, action_space, hidden_sizes=(256, 256), activation=nn.Tanh):
         super().__init__(observation_space, action_space)
+        try:
+            dim_obs = sum(prod(s for s in space.shape) for space in observation_space)
+            self.tuple_obs = True
+        except TypeError:
+            dim_obs = prod(observation_space.shape)
+            self.tuple_obs = False
 
-        obs_dim = sum(prod(s for s in space.shape) for space in observation_space)
-        act_dim = action_space.shape[0]
+        dim_act = action_space.shape[0]
+        log_std = -0.5 * np.ones(dim_act, dtype=np.float32)
+        self.log_std = torch.nn.Parameter(torch.as_tensor(log_std))
+        self.mu_layer = mlp([dim_obs] + list(hidden_sizes) + [dim_act], activation)
 
-        self.network = nn.Sequential(nn.Linear(obs_dim, 256), nn.ReLU(),
-                                     nn.Linear(256, 256), nn.ReLU(),
-                                     nn.Linear(256, 256))
+        self.act_limit = action_space.high[0]
 
-        self.mu_layer = nn.Linear(256, act_dim)
-        self.log_std_layer = nn.Linear(256, act_dim)
+    def _distribution(self, obs):
+        mu = self.mu_layer(obs)
+        std = torch.exp(self.log_std)
+        return Normal(mu, std)
 
-    def save(self, path):
-        with open(path, 'w') as json_file:
-            json.dump(self.state_dict(), json_file, cls=TorchJSONEncoder)
+    def _log_prob_from_distribution(self, pi, act):
+        act = torch.as_tensor(act)
+        return pi.log_prob(act).sum(axis=-1)
 
-    def load(self, path, device):
-        self.device = device
-        with open(path, 'r') as json_file:
-            state_dict = json.load(json_file, cls=TorchJSONDecoder)
-        self.load_state_dict(state_dict)
-        self.to_device(device)
-        return self
+    def forward(self, obs, act=None):
+        obs = torch.cat(obs, -1)
+        pi = self._distribution(obs)
+        logp_a = None
+        if act is not None:
+            logp_a = self._log_prob_from_distribution(pi, act)
 
-    def _process_observation(self, observation: tuple[Tensor]) -> Tensor:
-        processed_observations = []
+        a = pi.sample()
+        a = torch.tanh(a)
+        a = self.act_limit * a
+        res = a.squeeze().cpu().numpy()
+        if not len(res.shape):
+            res = np.expand_dims(res, 0)
 
-        for tensor in observation:
-            tensor = tensor.flatten(start_dim=1)
-            processed_observations.append(tensor)
+        return res, logp_a
 
-        return torch.cat(processed_observations, -1)
-
-    def forward(self, observation: tuple[Tensor], test=False, compute_logprob=True) -> tuple[Tensor, any]:
-        processed_observation = self._process_observation(observation)
-        network_output = self.network(processed_observation)
-
-        mu = self.mu_layer(network_output)
-
-        log_std = self.log_std_layer(network_output)
-        std = torch.exp(log_std)
-
-        pi_distribution = Normal(mu, std)
-
-        if test:
-            action = mu
-        else:
-            action = pi_distribution.rsample()
-
-        if compute_logprob:
-            logprob = pi_distribution.log_prob(action).sum(axis=-1)
-            logprob -= (2 * (np.log(2) - action - F.softplus(-2 * action))).sum(axis=1)
-        else:
-            logprob = None
-
-        action = torch.tanh(action)
-        action = action.squeeze()
-        return action, logprob
-
-    def act(self, observation: tuple[Tensor], test=False) -> Tensor:
+    def act(self, obs: tuple[Tensor], test=False):
+        obs = torch.cat(obs, -1)
         with torch.no_grad():
-            action = self.forward(observation, test, compute_logprob=False)[0].flatten()
-            return action.cpu().numpy()
+            pi = self._distribution(obs)
+            a = pi.sample()
+            logp_a = self._log_prob_from_distribution(pi, a)
+
+        a = torch.tanh(a)
+        a = self.act_limit * a
+        res = a.squeeze().cpu().numpy()
+        if not len(res.shape):
+            res = np.expand_dims(res, 0)
+
+        return res
 
 
 class PPOCriticModule(nn.Module):
-    def __init__(self, observation_space, action_space):
+    def __init__(self, obs_space, act_space, hidden_sizes=(256, 256), activation=nn.Tanh):
         super().__init__()
-        self.network = nn.Sequential(nn.Linear(83, 256), nn.ReLU(),
-                                     nn.Linear(256, 256), nn.ReLU(),
-                                     nn.Linear(256, 1))
+        try:
+            obs_dim = sum(prod(s for s in space.shape) for space in obs_space)
+            self.tuple_obs = True
+        except TypeError:
+            obs_dim = prod(obs_space.shape)
+            self.tuple_obs = False
 
-    def _process_observation(self, observation: tuple[Tensor]) -> Tensor:
-        processed_observations = []
+        self.q = mlp([obs_dim] + list(hidden_sizes) + [1], activation)
 
-        for tensor in observation:
-            tensor = tensor.flatten(start_dim=1)
-            processed_observations.append(tensor)
-
-        return torch.cat(processed_observations, -1)
-
-    def forward(self, observation: tuple[Tensor]):
-        processed_observation = self._process_observation(observation)
-        q = self.network(processed_observation)
+    def forward(self, obs):
+        x = torch.cat(obs, -1) if self.tuple_obs else torch.flatten(obs, start_dim=1)
+        q = self.q(x)
         return torch.squeeze(q, -1)
 
 
-class VanillaCNNPPO(nn.Module):
+class PPOActorCritic(nn.Module):
     def __init__(self, observation_space, action_space):
         super().__init__()
 
         self.actor = PPOActorModule(observation_space, action_space)
-        self.q1 = PPOCriticModule(observation_space, action_space)
-
-        # TODO: remove q2?
-        # self.q2 = PPOCriticModule(observation_space, action_space)
+        self.critic = PPOCriticModule(observation_space, action_space)
 
 
 class PPOTrainingAgent(TrainingAgent):
@@ -220,7 +362,7 @@ class PPOTrainingAgent(TrainingAgent):
                  observation_space=None,
                  action_space=None,
                  device=None,
-                 model_cls=VanillaCNNPPO,
+                 model_cls=PPOActorCritic,
                  gamma=0.99,
                  polyak=0.995,
                  alpha=0.2,
@@ -238,109 +380,81 @@ class PPOTrainingAgent(TrainingAgent):
         self.alpha = alpha
         self.lr_actor = lr_actor
         self.lr_critic = lr_critic
-        # self.q_params = itertools.chain(self.model.q1.parameters(), self.model.q2.parameters())
 
         self.pi_optimizer = Adam(self.model.actor.parameters(), lr=self.lr_actor)
-        self.q_optimizer = Adam(self.model.q1.parameters(), lr=self.lr_critic)
+        self.q_optimizer = Adam(self.model.critic.parameters(), lr=self.lr_critic)
         self.alpha_t = torch.tensor(float(self.alpha)).to(self.device)
 
-        # TODO: put these in the config
-        self.lambda_ = 0.95
-        self.clip_ratio = 0.2
+        self.lambda_ = params.lambda_
+        self.clip_ratio = params.clip_ratio
+        self.max_grad_norm = params.max_grad_norm
+        self.training_iterations = params.training_iterations
 
     def get_actor(self):
         return self.model_nograd.actor
 
-    def _compute_advantages_and_returns(self, rewards, values, terminates):
+    def _compute_loss_pi(self, observations, actions, advantages, logp_old):
+        _, logp = self.model.actor(observations, actions)
+        ratio = torch.exp(logp - logp_old)
+        clip_adv = torch.clamp(ratio, 1 - self.clip_ratio, 1 + self.clip_ratio) * advantages
+        loss_pi = -(torch.min(ratio * advantages, clip_adv)).mean()
 
-        trajectory_length = rewards.size(0)
+        # Useful extra info
+        approx_kl = (logp_old - logp).mean().item()
+        clipped = ratio.gt(1 + self.clip_ratio) | ratio.lt(1 - self.clip_ratio)
+        clipfrac = torch.as_tensor(clipped, dtype=torch.float32).mean().item()
 
-        deltas = torch.zeros_like(rewards)
-        returns = torch.zeros_like(rewards)
+        return loss_pi, approx_kl, clipfrac
+
+    def _compute_loss_v(self, observation, returns):
+        return ((self.model.critic(observation) - returns) ** 2).mean()
+
+    def _compute_values_advantages(self, initial_observations, final_observations, rewards, terminates, truncates):
+        values = self.model.critic(initial_observations)
+        final_values = self.model.critic(final_observations)
+
         advantages = torch.zeros_like(rewards)
 
-        previous_return = 0
-        previous_value = 0
-        previous_advantage = 0
-
-        for t in reversed(range(trajectory_length)):
-            if t == trajectory_length - 1:
-                next_non_terminal = 1.0 - terminates[-1]
-                next_value = values[-1]
+        for t in reversed(range(len(rewards))):
+            if t == len(rewards) - 1:
+                delta = rewards[t] + self.gamma * final_values[t] * (1 - terminates[t]) - values[t]
+                advantages[t] = delta
             else:
-                next_non_terminal = 1.0 - terminates[t]
-                next_value = values[t + 1]
+                delta = rewards[t] + self.gamma * values[t + 1] * (1 - terminates[t]) - values[t]
+                advantages[t] = delta + self.gamma * self.lambda_ * (1 - truncates[t]) * advantages[t + 1]
 
-            deltas[t] = rewards[t] + self.gamma * next_non_terminal * next_value - values[t]
-            returns[t] = deltas[t] + self.gamma * self.lambda_ * next_non_terminal * previous_return
-            advantages[t] = deltas[t] + self.gamma * self.lambda_ * next_non_terminal * previous_advantage
+        # Normalize advantages
+        advantages = (advantages - advantages.mean()) / advantages.std()
 
-            previous_return = returns[t]
-            previous_advantage = advantages[t]
-
-        return advantages, returns
-
-    def _compute_loss_pi(self, observations, actions, advantages, logp_old):
-
-        pi, logp = self.model.actor(observations, test=False, compute_logprob=True)
-
-        ratio = torch.exp(logp - logp_old)
-
-        clipped_advantages = torch.clamp(ratio, 1 - self.clip_ratio, 1 + self.clip_ratio) * advantages
-        loss_pi = -torch.min(ratio * advantages, clipped_advantages).mean()
-
-        # kl = (logp_old - logp).mean().item()
-        # ent = pi.entropy().mean().item()
-
-        # clipped = ratio.gt(1 + self.clip_ratio) | ratio.lt(1 - self.clip_ratio)
-        # clipfrac = torch.as_tensor(clipped, dtype=torch.float).mean().item()
-
-        # pi_info = {'kl': kl, 'ent': ent, 'cf': clipfrac}
-
-        return loss_pi  # , pi_info
-
-    def _update_target_model(self):
-        with torch.no_grad():
-            for param, target_param in zip(self.model.parameters(), self.model_target.parameters()):
-                target_param.data.mul_(self.polyak)
-                target_param.data.add_((1 - self.polyak) * param.data)
+        return values, advantages
 
     def train(self, batch):
+        initial_observations, actions, rewards, final_observations, terminates, truncates, logp_old, rtgs = batch
+        values, advantages = self._compute_values_advantages(initial_observations, final_observations, rewards,
+                                                             terminates, truncates)
 
-        # Decompose batch into relevant components
-        initial_observations, actions, rewards, final_observations, terminates, _ = batch
+        pi_l_old, approx_kl, clipfrac = self._compute_loss_pi(initial_observations, actions, advantages, logp_old)
+        pi_l_old = pi_l_old.item()
+        v_l_old = self._compute_loss_v(initial_observations, rtgs).item()
 
-        # Get value estimates from critic
-        values = self.model.q1(initial_observations)
+        for i in range(self.training_iterations):
+            self.pi_optimizer.zero_grad()
+            loss_pi, _, _ = self._compute_loss_pi(initial_observations, actions, advantages.detach(), logp_old)
+            loss_pi.backward()
+            nn.utils.clip_grad_norm_(self.model.actor.parameters(), self.max_grad_norm)
+            self.pi_optimizer.step()
 
-        # Calculate advantages and returns
-        advantages, returns = self._compute_advantages_and_returns(rewards, values, terminates)
-
-        # Get old log probabilities from actor
-        _, logp_old = self.model.actor(initial_observations, test=False, compute_logprob=True)
-
-        # Compute actor and critic losses
-        loss_actor = self._compute_loss_pi(initial_observations, actions, advantages, logp_old)
-        loss_critic = ((values - returns) ** 2).mean()
-
-        # TODO: figure out why this crashes
-
-        # Take optimization step for actor
-        self.pi_optimizer.zero_grad()
-        loss_actor.backward()
-        self.pi_optimizer.step()
-
-        # Take optimization step for critic
-        self.q_optimizer.zero_grad()
-        loss_critic.backward()
-        self.q_optimizer.step()
-
-        # Update target networks
-        self._update_target_model()
+        for i in range(self.training_iterations):
+            self.q_optimizer.zero_grad()
+            loss_v = self._compute_loss_v(initial_observations, rtgs)
+            loss_v.backward()
+            self.q_optimizer.step()
 
         ret_dict = dict(
-            loss_actor=loss_actor.detach().item(),
-            loss_critic=loss_critic.detach().item()
+            loss_actor=pi_l_old,
+            loss_critic=v_l_old,
+            approx_kl=approx_kl,
+            clipfrac=clipfrac
         )
 
         return ret_dict
@@ -348,7 +462,7 @@ class PPOTrainingAgent(TrainingAgent):
 
 # TrainingAgent class
 training_agent_cls = partial(PPOTrainingAgent,
-                             model_cls=VanillaCNNPPO,
+                             model_cls=PPOActorCritic,
                              gamma=0.99,
                              polyak=0.995,
                              alpha=0.02,
